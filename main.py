@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import uuid
 import os
 from dotenv import load_dotenv
@@ -12,19 +12,17 @@ from database import get_supabase_admin_client
 
 load_dotenv()
 
-app = FastAPI(title="Admin Assessment API", version="1.0.0")
+app = FastAPI(title="Admin Assessment API", version="1.2.0")
 
 # --- Pydantic Schemas ---
 
 class DifficultyDistribution(BaseModel):
-    # Add alias="easy", alias="medium", etc.
     Easy: int = Field(..., ge=0, le=100, alias="easy")
     Medium: int = Field(..., ge=0, le=100, alias="medium")
     Hard: int = Field(..., ge=0, le=100, alias="hard")
 
     @validator('*', always=True)
     def check_sum(cls, v, values):
-        # This logic still works because Pydantic maps 'easy' -> 'Easy' internally
         if 'Easy' in values and 'Medium' in values and 'Hard' in values:
             total = values['Easy'] + values['Medium'] + values['Hard']
             if total != 100:
@@ -32,17 +30,33 @@ class DifficultyDistribution(BaseModel):
         return v
     
     class Config:
-        # This allows the model to accept the alias ('easy') OR the field name ('Easy')
         populate_by_name = True
-        
-class AssessmentCreateRequest(BaseModel):
-    topic: str = Field(..., min_length=1)
-    total_questions: int = Field(..., gt=0)
+
+class TopicConfig(BaseModel):
+    topic_name: str = Field(..., alias="topic")
+    count: int = Field(..., gt=0)
     difficulty: DifficultyDistribution
+
+# NEW: Module & Client Schemas
+class ModuleCreate(BaseModel):
+    name: str
+    description: Optional[str] = ""
+
+class ClientCreate(BaseModel):
+    name: str
+    contact_email: Optional[str] = ""
+
+class AssignModuleRequest(BaseModel):
+    module_id: uuid.UUID
+
+# UPDATED: Assessment Schema now accepts an optional Module ID
+class AssessmentCreateRequest(BaseModel):
+    topics: List[TopicConfig] = Field(..., min_items=1)
+    module_id: Optional[uuid.UUID] = None # NEW FIELD
 
 class AssessmentResponse(BaseModel):
     id: uuid.UUID
-    topic: str
+    topics: List[dict]
     total_questions: int
     message: str
 
@@ -54,42 +68,38 @@ class SubmissionRecord(BaseModel):
 
 # --- Helper Functions ---
 
-def create_assessment_record(topic: str, total: int, distribution: dict) -> uuid.UUID:
-    """
-    Inserts into 'assessments' table.
-    Schema: id, topic, total_questions, difficulty_distribution
-    """
+def create_assessment_record(topics_config: list, total: int, module_id: Optional[uuid.UUID] = None) -> uuid.UUID:
     client = get_supabase_admin_client()
     
+    # FIX: Create a valid JSON object for difficulty_distribution
+    # Since we now have multiple topics with specific difficulties, 
+    # we save the list of topics here as well to act as the 'distribution' record.
+    
     data = {
-        "topic": topic,
+        "topic": topics_config, 
         "total_questions": total,
-        "difficulty_distribution": distribution  # Stored as JSONB per your schema
+        "difficulty_distribution": topics_config, # Store the topic list here to prevent the NULL error
+        "module_id": str(module_id) if module_id else None
     }
     
     try:
         response = client.table('assessments').insert(data).execute()
-        # Extract the UUID from the response
         return uuid.UUID(response.data[0]['id'])
     except Exception as e:
         print(f"DB Error creating assessment: {e}")
         raise HTTPException(status_code=500, detail="Failed to create assessment record.")
 
 def save_questions_to_db(assessment_id: uuid.UUID, questions: list[dict]):
-    """
-    Inserts into 'questions' table.
-    Schema: id, assessment_id, question_text, options, correct_answer, difficulty
-    """
     client = get_supabase_admin_client()
-    
     questions_to_insert = []
     for q in questions:
         questions_to_insert.append({
-            "assessment_id": str(assessment_id), # FK must be string/UUID
+            "assessment_id": str(assessment_id),
+            "topic": q.get('topic', 'General'),
             "question_text": q['question_text'],
-            "options": q['options'],              # JSONB
+            "options": q['options'],
             "correct_answer": q['correct_answer'],
-            "difficulty": q['difficulty']         # Text: 'Easy', 'Medium', 'ard'
+            "difficulty": q['difficulty']
         })
     
     try:
@@ -98,68 +108,130 @@ def save_questions_to_db(assessment_id: uuid.UUID, questions: list[dict]):
         print(f"DB Error saving questions: {e}")
         raise HTTPException(status_code=500, detail="Failed to save generated questions.")
 
-# --- Admin Endpoints ---
+# ==========================================
+# MODULES & CLIENTS ENDPOINTS
+# ==========================================
+
+@app.post("/admin/modules", status_code=201)
+async def create_module(module: ModuleCreate):
+    client = get_supabase_admin_client()
+    try:
+        response = client.table('modules').insert(module.dict()).execute()
+        return response.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/modules")
+async def get_modules():
+    client = get_supabase_admin_client()
+    response = client.table('modules').select("*").execute()
+    return response.data
+
+@app.delete("/admin/modules/{module_id}")
+async def delete_module(module_id: str):
+    client = get_supabase_admin_client()
+    try:
+        client.table('modules').delete().eq('id', module_id).execute()
+        return {"message": "Module deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/clients", status_code=201)
+async def create_client(client: ClientCreate):
+    db = get_supabase_admin_client()
+    try:
+        response = db.table('clients').insert(client.dict()).execute()
+        return response.data[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/clients")
+async def get_clients():
+    db = get_supabase_admin_client()
+    response = db.table('clients').select("*").execute()
+    return response.data
+
+@app.delete("/admin/clients/{client_id}")
+async def delete_client(client_id: str):
+    db = get_supabase_admin_client()
+    try:
+        db.table('clients').delete().eq('id', client_id).execute()
+        return {"message": "Client deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/clients/{client_id}/assign")
+async def assign_module_to_client(client_id: str, req: AssignModuleRequest):
+    db = get_supabase_admin_client()
+    try:
+        # Insert into junction table
+        db.table('client_modules').insert({
+            "client_id": client_id, 
+            "module_id": str(req.module_id)
+        }).execute()
+        return {"message": "Module assigned to client"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Assessment Endpoint (Updated) ---
 
 @app.post("/admin/assessments", response_model=AssessmentResponse, status_code=201)
 async def create_assessment(request: AssessmentCreateRequest):
-    """
-    US-001 & US-002: 
-    1. Validates difficulty sums to 100%.
-    2. Creates Assessment Record (Parent).
-    3. Calls AI to generate questions.
-    4. Saves Questions (Children).
-    """
     
-    # 1. Create the Assessment config
+    # 1. Create the Assessment Record
     assessment_id = create_assessment_record(
-        request.topic, 
-        request.total_questions, 
-        request.difficulty.dict()
+        [t.dict() for t in request.topics], 
+        sum(t.count for t in request.topics),
+        request.module_id
     )
 
-    # 2. Generate Questions via AI
+    # 2. Generate Questions for each topic
+    all_generated_questions = []
+    
     try:
-        generated_questions = generate_questions(
-            topic=request.topic, 
-            total=request.total_questions, 
-            distribution=request.difficulty.dict()
-        )
+        for topic_config in request.topics:
+            print(f"Generating {topic_config.count} questions for {topic_config.topic_name}...")
+            
+            # Generate questions
+            generated_questions = generate_questions(
+                topic=topic_config.topic_name, 
+                total=topic_config.count, 
+                distribution=topic_config.difficulty.dict()
+            )
+            
+            # FIX: Strictly slice the list to match the exact count requested
+            if len(generated_questions) > topic_config.count:
+                generated_questions = generated_questions[:topic_config.count]
+                
+            # Tag topic
+            for q in generated_questions:
+                q['topic'] = topic_config.topic_name
+                
+            all_generated_questions.extend(generated_questions)
+            
     except ValueError as e:
-        # US-008: Handle AI failure
         raise HTTPException(status_code=500, detail=f"AI Generation failed: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail="Unexpected error during generation.")
 
     # 3. Save to Database
-    try:
-        save_questions_to_db(assessment_id, generated_questions)
-    except HTTPException:
-        raise # Re-raise the HTTP exception from the helper
+    save_questions_to_db(assessment_id, all_generated_questions)
 
     return {
         "id": assessment_id,
-        "topic": request.topic,
-        "total_questions": len(generated_questions),
-        "message": f"Successfully generated {len(generated_questions)} questions."
+        "topics": [t.dict() for t in request.topics],
+        "total_questions": len(all_generated_questions),
+        "message": f"Successfully generated {len(all_generated_questions)} questions."
     }
 
 @app.get("/admin/assessments/{assessment_id}/results", response_model=List[SubmissionRecord])
 async def get_assessment_results(assessment_id: str):
-    """
-    US-007: View all student data for a specific assessment.
-    Fetches from 'submissions' table.
-    """
     client = get_supabase_admin_client()
-    
     try:
-        # Validate UUID format
         uuid_id = uuid.UUID(assessment_id)
-        
-        # Fetch all submissions for this assessment
         response = client.table('submissions').select("*").eq('assessment_id', str(uuid_id)).execute()
-        
         return response.data
-        
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid Assessment ID format.")
     except Exception as e:
