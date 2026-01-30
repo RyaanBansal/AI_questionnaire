@@ -100,6 +100,14 @@ class ModuleCreate(BaseModel):
 class ClientCreate(BaseModel):
     name: str
     contact_email: Optional[str] = ""
+    
+class StudentCreate(BaseModel):
+    email: str
+    password: str
+    full_name: Optional[str] = None
+    client_id: uuid.UUID
+    role: str = "student"
+    phone: Optional[str] = None
 
 class AssignModuleRequest(BaseModel):
     module_id: uuid.UUID
@@ -479,3 +487,37 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 @app.get("/users/me")
 async def read_users_me(current_user = Depends(get_current_user)):
     return current_user
+
+@app.post("/admin/students", status_code=201)
+async def create_student(student: StudentCreate):
+    admin = get_supabase_admin_client()
+    
+    data = {
+        "email": student.email,
+        "password": student.password, 
+        "full_name": student.full_name,
+        "client_id": str(student.client_id), 
+        "role": student.role,
+        "phone": student.phone  # <--- ADD THIS LINE
+    }
+    
+    try:
+        response = admin.table('students').insert(data).execute()
+        return response.data[0]
+    except Exception as e:
+        # ... existing error handling ...
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/students")
+async def get_students():
+    """
+    Fetches all students to display in the Admin Dashboard.
+    """
+    admin = get_supabase_admin_client()
+    try:
+        # Select all columns
+        response = admin.table('students').select("*").order("created_at", desc=True).execute()
+        return response.data
+    except Exception as e:
+        print(f"Error fetching students: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
