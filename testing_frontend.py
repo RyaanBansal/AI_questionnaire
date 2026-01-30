@@ -69,8 +69,7 @@ def render_auth_page():
     st.title("🔐 Authentication Portal")
     
     # Toggle between Login and Signup
-    mode = st.radio("", ["Login", "Sign Up"], horizontal=True, label_visibility="collapsed")
-
+    mode = st.radio("Auth Mode", ["Login", "Sign Up"], horizontal=True, label_visibility="collapsed")
     # --- LOGIN ---
     if mode == "Login":
         with st.form("login_form"):
@@ -133,7 +132,7 @@ def render_admin_dashboard():
     st.caption(f"Welcome, {st.session_state.get('username', 'Admin')}")
 
     # --- TABS ---
-    t1, t2, t3, t4 = st.tabs(["Modules", "Clients", "Create Assessment", "View Results"])
+    t1, t2, t3, t4, t5 = st.tabs(["Modules", "Clients", "Create Assessment", "View Results", "Manage Students"])
 
     # ==========================================
     # TAB 1: MODULES
@@ -509,6 +508,109 @@ def render_admin_dashboard():
                 if r.status_code == 200:
                     st.dataframe(pd.DataFrame(r.json()))
                 else: st.error(r.text)
+    
+    with t5:
+        st.header("Manage Students")
+        
+        # --- Step 1: Fetch Clients for Dropdown ---
+        try:
+            clients_response = requests.get(f"{API_URL}/admin/clients")
+            if clients_response.status_code == 200:
+                all_clients = clients_response.json()
+            else:
+                all_clients = []
+                st.error("Could not fetch clients.")
+        except:
+            all_clients = []
+            st.error("Connection error fetching clients.")
+
+        # --- Step 2: Create Student Form ---
+        with st.expander("➕ Create New Student Profile", expanded=True):
+            if not all_clients:
+                st.warning("⚠️ No Clients found. Please create a Client in the 'Clients' tab before adding students.")
+            else:
+                with st.form("create_student_form"):
+                    # Map client ID to Name for the dropdown
+                    client_options = {c['id']: c['name'] for c in all_clients}
+                    
+                    s_name = st.text_input("Full Name")
+                    s_email = st.text_input("Email (Login ID)")
+                    s_phone = st.text_input("Phone Number")
+                    s_password = st.text_input("Password", type="password")
+                    s_confirm_password = st.text_input("Confirm Password", type="password")
+                    
+                    # Client Dropdown
+                    selected_client_id = st.selectbox(
+                        "Assign to Client", 
+                        options=list(client_options.keys()), 
+                        format_func=lambda x: client_options[x]
+                    )
+                    
+                    submitted = st.form_submit_button("Create Student")
+                    
+                    if submitted:
+                        if not s_email or not s_password:
+                            st.error("Email and Password are required.")
+                        elif s_password != s_confirm_password:
+                            st.error("Passwords do not match.")
+                        else:
+                            payload = {
+                                "email": s_email,
+                                "phone": s_phone,
+                                "password": s_password,
+                                "full_name": s_name,
+                                "client_id": selected_client_id, # <--- Sending Client ID
+                                "role": "student"
+                            }
+                            
+                            with st.spinner("Creating student in Supabase..."):
+                                r = requests.post(f"{API_URL}/admin/students", json=payload)
+                                
+                                if r.status_code == 201:
+                                    st.success(f"Student created under {client_options[selected_client_id]}!")
+                                elif r.status_code == 400:
+                                    st.error("Student with this email likely already exists.")
+                                else:
+                                    st.error(f"Failed: {r.text}")
+
+        st.markdown("---")
+        
+        # --- Step 3: List Existing Students ---
+        st.subheader("Existing Students")
+        try:
+            # Assuming backend returns list of student objects
+            r = requests.get(f"{API_URL}/admin/students")
+            if r.status_code == 200:
+                students = r.json()
+                if students:
+                    # Prepare Data for DataFrame
+                    student_data = []
+                    for s in students:
+                        # Find client name for display
+                        client_name = "Unknown"
+                        if s.get('client_id') and all_clients:
+                            # Look up client name from the list we fetched earlier
+                            # Note: If a student belongs to a client not in the current list (rare), it will be Unknown
+                            match = next((c['name'] for c in all_clients if c['id'] == s.get('client_id')), None)
+                            if match: client_name = match
+
+                        student_data.append({
+                            "Name": s.get('full_name', 'N/A'),
+                            "Email": s.get('email'),
+                            "Phone": s.get('phone', '-'),
+                            "Client": client_name,
+                            "Created": str(s.get('created_at', ''))[:10]
+                        })
+                    
+                    st.dataframe(pd.DataFrame(student_data), use_container_width=True)
+                else:
+                    st.info("No students found.")
+            else:
+                st.info("Could not load student list (Backend endpoint might be missing).")
+        except Exception as e:
+            st.error(f"Error loading students: {e}")
+                
+    
 
 # ==========================================
 # PAGE 3: STUDENT DASHBOARD
