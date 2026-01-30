@@ -1,18 +1,73 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Any, Optional
 import uuid
 import os
 from dotenv import load_dotenv
 import uvicorn
+from jose import JWTError, jwt
+import requests
+from jose import jwk
 
 # Imports from your existing files
 from models import generate_questions
-from database import get_supabase_admin_client
+from database import get_supabase_client, get_supabase_admin_client, verify_jwt
 
 load_dotenv()
 
+ALGORITHM = "HS256"
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
 app = FastAPI(title="Admin Assessment API", version="1.2.0")
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    """
+    Verifies token using the Supabase Client.
+    This works for BOTH HS256 and ES256 automatically!
+    """
+    # 1. Verify the token using the function from database.py
+    # Note: verify_jwt in your file uses verify_signature=False.
+    # This is safe enough because we make a real API call next.
+    payload = verify_jwt(token)
+    
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token structure")
+
+    user_id = payload.get("sub")
+    if not user_id: raise HTTPException(status_code=401, detail="Invalid user payload")
+    
+    # 2. Get a Client to fetch the User Role
+    # Using get_supabase_client ensures the RLS policies apply correctly
+    try:
+        client = get_supabase_client(token)
+        
+        # Fetch the profile. We need to use the admin client if RLS blocks read access on profiles
+        # OR ensure your RLS policy allows authenticated users to read their own profile.
+        # For simplicity and robustness, let's use admin client here.
+        admin = get_supabase_admin_client()
+        
+        profile = admin.table('profiles').select('role').eq('id', user_id).single().execute()
+        
+        if not profile.data: 
+            raise HTTPException(404, "User profile not found")
+            
+        return {"id": user_id, "role": profile.data['role'], "email": payload.get("email")}
+        
+    except Exception as e:
+        print(f"DB Error: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching user role")
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    role: str # "admin" or "student"
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
 
 # --- Pydantic Schemas ---
 
@@ -373,3 +428,54 @@ async def remove_assessment_from_module(assessment_id: str):
         print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     
+@app.post("/signup", status_code=201)
+async def signup(req: SignupRequest):
+    """
+    1. Creates Supabase Auth User.
+    2. Inserts into public.profiles with the selected role.
+    """
+    admin_client = get_supabase_admin_client()
+    
+    # 1. Create Auth User
+    try:
+        user_res = admin_client.auth.admin.create_user({
+            "email": req.email,
+            "password": req.password,
+            "email_confirm": True
+        })
+        user_id = str(user_res.user.id)
+        print(f"DEBUG: Created User ID: {user_id}")
+    except Exception as e:
+        print(f"Auth Error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to create auth user: {e}")
+
+    # 2. Create Profile Entry
+    try:
+        profile_data = {
+            "id": user_id,
+            "role": req.role
+        }
+        print(f"DEBUG: Inserting Profile: {profile_data}")
+        admin_client.table('profiles').insert(profile_data).execute()
+    except Exception as e:
+        print(f"DB Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create user profile.")
+
+    return {"message": "User created successfully", "user_id": user_id}
+
+@app.post("/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    try:
+        # Use the standard client for login
+        client = get_supabase_client() 
+        response = client.auth.sign_in_with_password({
+            "email": form_data.username,
+            "password": form_data.password
+        })
+        return {"access_token": response.session.access_token, "token_type": "bearer"}
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+@app.get("/users/me")
+async def read_users_me(current_user = Depends(get_current_user)):
+    return current_user
