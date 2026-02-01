@@ -9,6 +9,7 @@ import uvicorn
 from jose import JWTError, jwt
 import requests
 from jose import jwk
+import datetime
 
 # Imports from your existing files
 from models import generate_questions
@@ -16,19 +17,26 @@ from database import get_supabase_client, get_supabase_admin_client, verify_jwt
 
 load_dotenv()
 
+SECRET_KEY = os.getenv("SUPABASE_JWT_SECRET")
 ALGORITHM = "HS256"
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+def create_student_token(email: str, student_id: str):
+    """Generates a custom JWT token for a student"""
+    payload = {
+        "sub": student_id, # Subject is the user ID
+        "email": email,
+        "role": "student",
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 app = FastAPI(title="Admin Assessment API", version="1.2.0")
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     """
-    Verifies token using the Supabase Client.
-    This works for BOTH HS256 and ES256 automatically!
+    Verifies token. Checks BOTH 'profiles' (Admins) and 'students' tables.
     """
-    # 1. Verify the token using the function from database.py
-    # Note: verify_jwt in your file uses verify_signature=False.
-    # This is safe enough because we make a real API call next.
     payload = verify_jwt(token)
     
     if not payload:
@@ -37,26 +45,31 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     user_id = payload.get("sub")
     if not user_id: raise HTTPException(status_code=401, detail="Invalid user payload")
     
-    # 2. Get a Client to fetch the User Role
-    # Using get_supabase_client ensures the RLS policies apply correctly
+    admin = get_supabase_admin_client()
+    
+    # 1. Try finding in 'profiles' (Admin)
     try:
-        client = get_supabase_client(token)
-        
-        # Fetch the profile. We need to use the admin client if RLS blocks read access on profiles
-        # OR ensure your RLS policy allows authenticated users to read their own profile.
-        # For simplicity and robustness, let's use admin client here.
-        admin = get_supabase_admin_client()
-        
         profile = admin.table('profiles').select('role').eq('id', user_id).single().execute()
-        
-        if not profile.data: 
-            raise HTTPException(404, "User profile not found")
-            
-        return {"id": user_id, "role": profile.data['role'], "email": payload.get("email")}
-        
-    except Exception as e:
-        print(f"DB Error: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching user role")
+        if profile.data:
+            return {"id": user_id, "role": profile.data['role'], "email": payload.get("email")}
+    except:
+        pass # Not a profile, check students next
+
+    # 2. Try finding in 'students' (Student)
+    try:
+        student = admin.table('students').select('role, full_name, email').eq('id', user_id).single().execute()
+        if student.data:
+            return {
+                "id": user_id, 
+                "role": student.data['role'], 
+                "email": student.data['email'],
+                "full_name": student.data['full_name']
+            }
+    except:
+        pass
+
+    # 3. If neither found
+    raise HTTPException(status_code=401, detail="User not found in profiles or students table")
 
 class SignupRequest(BaseModel):
     email: str
@@ -145,7 +158,7 @@ class SubmissionRecord(BaseModel):
 
 # --- Helper Functions ---
 
-def create_assessment_record(topics_config: list, total: int, module_id: Optional[uuid.UUID] = None) -> uuid.UUID:
+def create_assessment_record(topics_config: list, total: int, module_id: Optional[uuid.UUID] = None, type: str = "AI") -> uuid.UUID:
     client = get_supabase_admin_client()
     
     # FIX: Create a valid JSON object for difficulty_distribution
@@ -156,7 +169,8 @@ def create_assessment_record(topics_config: list, total: int, module_id: Optiona
         "topic": topics_config, 
         "total_questions": total,
         "difficulty_distribution": topics_config, # Store the topic list here to prevent the NULL error
-        "module_id": str(module_id) if module_id else None
+        "module_id": str(module_id) if module_id else None,
+        "type": type
     }
     
     try:
@@ -341,6 +355,30 @@ async def create_assessment(request: AssessmentCreateRequest):
         "message": f"Successfully generated {len(all_generated_questions)} questions."
     }
 
+@app.post("/admin/assessments/config", response_model=AssessmentResponse, status_code=201)
+async def create_assessment_config(request: AssessmentCreateRequest):
+    """
+    Creates an Assessment record with the topic configuration only.
+    No questions are generated or saved yet. This is used for planning.
+    """
+    # 1. Create the Assessment Record (storing the config)
+    # We sum up the counts to store as 'total_questions' for the record, 
+    # even though the actual questions table is empty.
+    assessment_id = create_assessment_record(
+        [t.dict() for t in request.topics], 
+        sum(t.count for t in request.topics),
+        module_id=None,
+        type = "AI"
+    )
+
+    # 2. Return the ID immediately (Skip AI Generation)
+    return {
+        "id": assessment_id,
+        "topics": [t.dict() for t in request.topics],
+        "total_questions": sum(t.count for t in request.topics),
+        "message": f"Configuration saved successfully. You can now assign this to a module."
+    }
+
 @app.get("/admin/assessments")
 async def get_all_assessments():
     """
@@ -351,16 +389,20 @@ async def get_all_assessments():
     response = db.table('assessments').select("*, modules(name)").order("created_at", desc=True).execute()
     return response.data
 
-@app.get("/admin/assessments/{assessment_id}/results", response_model=List[SubmissionRecord])
+@app.get("/admin/assessments/{assessment_id}/results")
 async def get_assessment_results(assessment_id: str):
+    """
+    Fetches all submissions for an assessment, joined with student details.
+    Ordered by score descending.
+    """
     client = get_supabase_admin_client()
     try:
-        uuid_id = uuid.UUID(assessment_id)
-        response = client.table('submissions').select("*").eq('assessment_id', str(uuid_id)).execute()
+        # Select submissions and join with students table
+        # 'students(*)' returns all columns from the related student row
+        response = client.table('submissions').select("*, students(full_name, email)").eq('assessment_id', assessment_id).order('score', desc=True).execute()
         return response.data
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Assessment ID format.")
     except Exception as e:
+        print(f"Error fetching results: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
@@ -378,7 +420,8 @@ async def create_manual_assessment(req: ManualAssessmentRequest):
         "topic": [{"name": req.topic, "count": len(req.questions)}], # Summary format
         "total_questions": len(req.questions),
         "difficulty_distribution": {"type": "manual"}, # Placeholder
-        "module_id": str(req.module_id) if req.module_id else None
+        "module_id": str(req.module_id) if req.module_id else None,
+        "type": "Manual"
     }
     
     try:
@@ -521,3 +564,194 @@ async def get_students():
     except Exception as e:
         print(f"Error fetching students: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/student/login", response_model=Token)
+async def student_login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Custom login for students stored in the 'students' table.
+    """
+    admin = get_supabase_admin_client()
+    
+    try:
+        # 1. Check if email exists in students table
+        response = admin.table('students').select("*").eq('email', form_data.username).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=400, detail="Incorrect email or password")
+            
+        student_record = response.data[0]
+        
+        # 2. Verify Password (WARNING: Comparing plain text passwords here)
+        # In production, use passlib.context to check hashed passwords
+        if student_record['password'] != form_data.password:
+            raise HTTPException(status_code=400, detail="Incorrect email or password")
+            
+        # 3. Generate Token
+        access_token = create_student_token(student_record['email'], str(student_record['id']))
+        
+        return {"access_token": access_token, "token_type": "bearer"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Student Login Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+    
+@app.get("/student/dashboard")
+async def get_student_dashboard(current_user = Depends(get_current_user)):
+    """
+    Returns Client info and all Modules/Assessments assigned to the student's client.
+    """
+    # 1. Authorization Check
+    if current_user.get('role') != 'student':
+        raise HTTPException(status_code=403, detail="Access denied. Students only.")
+
+    admin = get_supabase_admin_client()
+    
+    try:
+        # 2. Get Student's Client ID
+        student_resp = admin.table('students').select("client_id").eq('id', current_user['id']).single().execute()
+        if not student_resp.data:
+            raise HTTPException(status_code=404, detail="Student profile not found")
+        
+        client_id = student_resp.data.get('client_id')
+        
+        if not client_id:
+            # Student exists but has no client assigned
+            return {"client": None, "modules": []}
+
+        # 3. Get Client Details
+        client_resp = admin.table('clients').select("*").eq('id', client_id).single().execute()
+        client_data = client_resp.data
+
+        # 4. Get Modules assigned to this Client (via client_modules junction table)
+        # We fetch the 'modules' nested inside the 'client_modules' table
+        cm_resp = admin.table('client_modules').select("modules(*)").eq('client_id', client_id).execute()
+        
+        modules_list = []
+        for item in cm_resp.data:
+            if item.get('modules'):
+                modules_list.append(item['modules'])
+
+        # 5. Enrich Modules with their Assessments
+        enriched_modules = []
+        for mod in modules_list:
+            mod_id = mod['id']
+            
+            # Fetch assessments linked to this specific module
+            ass_resp = admin.table('assessments').select("*").eq('module_id', mod_id).execute()
+            
+            enriched_modules.append({
+                "id": mod['id'],
+                "name": mod['name'],
+                "description": mod.get('description', ''),
+                "assessments": ass_resp.data
+            })
+
+        return {
+            "client": client_data,
+            "modules": enriched_modules
+        }
+
+    except Exception as e:
+        print(f"Error loading student dashboard: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load dashboard data")
+    
+@app.get("/student/assessments/{assessment_id}/questions")
+async def get_assessment_questions(assessment_id: str, current_user = Depends(get_current_user)):
+    """Fetches questions for Manual assessments."""
+    if current_user.get('role') != 'student':
+        raise HTTPException(status_code=403, detail="Students only.")
+    
+    admin = get_supabase_admin_client()
+    
+    # 1. Check if assessment is Manual
+    ass_resp = admin.table('assessments').select("type").eq('id', assessment_id).single().execute()
+    if not ass_resp.data or ass_resp.data.get('type') != 'Manual':
+        raise HTTPException(status_code=400, detail="Assessment is not Manual or not found.")
+        
+    # 2. Fetch questions
+    q_resp = admin.table('questions').select("*").eq('assessment_id', assessment_id).execute()
+    return q_resp.data
+
+@app.get("/student/assessments/{assessment_id}/generate")
+async def generate_assessment_questions(assessment_id: str, current_user = Depends(get_current_user)):
+    """Generates questions for AI assessments on the fly (not saved to DB)."""
+    if current_user.get('role') != 'student':
+        raise HTTPException(status_code=403, detail="Students only.")
+    
+    admin = get_supabase_admin_client()
+    
+    # 1. Get Assessment Config
+    ass_resp = admin.table('assessments').select("topic").eq('id', assessment_id).single().execute()
+    if not ass_resp.data:
+        raise HTTPException(status_code=404, detail="Assessment not found")
+    
+    config_list = ass_resp.data.get('topic') 
+    if not config_list:
+        raise HTTPException(status_code=400, detail="Assessment configuration is missing.")
+
+    # 2. Generate Questions
+    all_generated_questions = []
+    try:
+        from models import generate_questions 
+        
+        for topic_config in config_list:
+            generated = generate_questions(
+                topic=topic_config.get('topic_name') or topic_config.get('topic'), 
+                total=topic_config.get('count'), 
+                distribution=topic_config.get('difficulty', {})
+            )
+            
+            if len(generated) > topic_config.get('count'):
+                generated = generated[:topic_config.get('count')]
+            
+            # --- MAPPING LOGIC (NEW) ---
+            # Ensure correct_answer is a letter (A, B, C, D)
+            for q in generated:
+                options = q.get('options', [])
+                ca = q.get('correct_answer')
+                
+                # If AI returned text instead of letter, map it
+                if isinstance(ca, str) and ca not in ['A', 'B', 'C', 'D']:
+                    if ca in options:
+                        # Find index and convert to Letter (0->A, 1->B...)
+                        idx = options.index(ca)
+                        q['correct_answer'] = chr(65 + idx)
+                # -------------------------
+
+                q['topic_display'] = topic_config.get('topic_name') or topic_config.get('topic')
+            
+            all_generated_questions.extend(generated)
+            
+    except Exception as e:
+        print(f"AI Gen Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate questions.")
+
+    return all_generated_questions
+
+
+class SubmissionCreate(BaseModel):
+    assessment_id: uuid.UUID
+    score: float
+
+@app.post("/student/submissions")
+async def submit_submission(sub: SubmissionCreate, current_user = Depends(get_current_user)):
+    """Saves the student's score."""
+    if current_user.get('role') != 'student':
+        raise HTTPException(status_code=403, detail="Students only.")
+    
+    admin = get_supabase_admin_client()
+    
+    data = {
+        "student_id": current_user['id'],
+        "assessment_id": str(sub.assessment_id),
+        "score": sub.score
+    }
+    
+    try:
+        admin.table('submissions').insert(data).execute()
+        return {"message": "Score saved successfully"}
+    except Exception as e:
+        print(f"Submission Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save score.")
