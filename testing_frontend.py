@@ -112,84 +112,68 @@ def exit_exam():
 def render_auth_page():
     st.title("🔐 Authentication Portal")
     
-    # Toggle between Login and Signup
-    mode = st.radio("Auth Mode", ["Login", "Sign Up"], horizontal=True, label_visibility="collapsed")
     # --- LOGIN ---
-    if mode == "Login":
-        with st.form("login_form"):
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
+    with st.form("login_form"):
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
             
-            # --- NEW: Role Selection ---
-            role = st.radio("I am a:", ["Admin", "Student"], horizontal=True)
+        # --- NEW: Role Selection ---
+        role = st.radio("I am a:", ["Admin", "Student"], horizontal=True)
             
-            submitted = st.form_submit_button("Login")
+        submitted = st.form_submit_button("Login")
             
-            if submitted:
-                try:
-                    # --- ADMIN LOGIC ---
-                    if role == "Admin":
-                        r = requests.post(f"{API_URL}/login", data={"username": email, "password": password})
+        if submitted:
+            try:
+                # --- ADMIN LOGIC ---
+                if role == "Admin":
+                    r = requests.post(f"{API_URL}/admin/login", data={"username": email, "password": password})
+                    
+                    if r.status_code == 200:
+                        st.session_state.token = r.json()['access_token']
+                        st.session_state.username = email
+                    
+                        # Fetch Role to determine page
+                        headers = get_auth_headers()
+                        user_resp = requests.get(f"{API_URL}/users/me", headers=headers)
                         
-                        if r.status_code == 200:
-                            st.session_state.token = r.json()['access_token']
-                            st.session_state.username = email
-                            
-                            # Fetch Role
-                            headers = get_auth_headers()
-                            user_resp = requests.get(f"{API_URL}/users/me", headers=headers)
-                            
-                            if user_resp.status_code == 200:
-                                user_data = user_resp.json()
-                                st.session_state.role = user_data['role']
-                                st.success(f"Logged in as Admin")
+                        if user_resp.status_code == 200:
+                            user_data = user_resp.json()
+                            st.session_state.role = user_data['role']
+                        
+                        # Redirect to correct dashboard
+                            if user_data['role'] == 'super_admin':
+                                set_page("super_admin")
+                            else:
                                 set_page("admin")
-                            else:
-                                st.error("Failed to retrieve user details")
                         else:
-                            st.error(r.text)
+                            st.error("Failed to retrieve user details")
+                    else:
+                        st.error(r.text)
 
-                    # --- STUDENT LOGIC ---
-                    elif role == "Student":
-                        r = requests.post(f"{API_URL}/student/login", data={"username": email, "password": password})
+                # --- STUDENT LOGIC ---
+                elif role == "Student":
+                    r = requests.post(f"{API_URL}/student/login", data={"username": email, "password": password})
                         
-                        if r.status_code == 200:
-                            st.session_state.token = r.json()['access_token']
-                            st.session_state.username = email
+                    if r.status_code == 200:
+                        st.session_state.token = r.json()['access_token']
+                        st.session_state.username = email
                             
-                            # Fetch Role
-                            headers = get_auth_headers()
-                            user_resp = requests.get(f"{API_URL}/users/me", headers=headers)
+                        # Fetch Role
+                        headers = get_auth_headers()
+                        user_resp = requests.get(f"{API_URL}/users/me", headers=headers)
                             
-                            if user_resp.status_code == 200:
-                                user_data = user_resp.json()
-                                st.session_state.role = user_data['role']
-                                st.success(f"Logged in as Student")
-                                set_page("student")
-                            else:
-                                st.error("Failed to retrieve student details")
+                        if user_resp.status_code == 200:
+                            user_data = user_resp.json()
+                            st.session_state.role = user_data['role']
+                            st.success(f"Logged in as Student")
+                            set_page("student")
                         else:
-                            st.error(r.text)
+                            st.error("Failed to retrieve student details")
+                    else:
+                        st.error(r.text)
                             
-                except Exception as e:
-                    st.error(f"Connection Error: {e}")
-
-    # --- SIGNUP (Unchanged) ---
-    else:
-        with st.form("signup_form"):
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
-            role = "admin" # Defaulting signup to Admin
-            submitted = st.form_submit_button("Create Account")
-            
-            if submitted:
-                payload = {"email": email, "password": password, "role": role}
-                r = requests.post(f"{API_URL}/signup", json=payload)
-                if r.status_code == 201:
-                    st.success("Account created! Please Login.")
-                    st.rerun()
-                else:
-                    st.error(r.text)
+            except Exception as e:
+                st.error(f"Connection Error: {e}")
 
 # ==========================================
 # PAGE 2: ADMIN DASHBOARD (UPDATED)
@@ -555,19 +539,23 @@ def render_admin_dashboard():
                     s_name = st.text_input("Full Name")
                     s_email = st.text_input("Email (Login ID)")
                     s_phone = st.text_input("Phone Number")
-                    s_password = st.text_input("Password", type="password")
-                    s_confirm_password = st.text_input("Confirm Password", type="password")
                     selected_client_id = st.selectbox("Assign to Client", options=list(client_options.keys()), format_func=lambda x: client_options[x])
                     submitted = st.form_submit_button("Create Student")
                     
                     if submitted:
-                        if not s_email or not s_password: st.error("Email and Password are required.")
-                        elif s_password != s_confirm_password: st.error("Passwords do not match.")
+                        if not s_email: st.error("Email is required.")
+                        
                         else:
-                            payload = {"email": s_email, "password": s_password, "full_name": s_name, "client_id": selected_client_id, "role": "student", "phone": s_phone}
+                            payload = {"email": s_email, "full_name": s_name, "client_id": selected_client_id, "role": "student", "phone": s_phone}
                             with st.spinner("Creating student in Supabase..."):
                                 r = requests.post(f"{API_URL}/admin/students", json=payload)
-                                if r.status_code == 201: st.success(f"Student created under {client_options[selected_client_id]}!")
+                                if r.status_code == 201: 
+                                    resp_data = r.json()
+                                    st.success(f"Student {resp_data['email']} created under {client_options[selected_client_id]}!")
+                                    pwd = resp_data.get('generated_password')
+                                    if pwd:
+                                        st.info(f"🔑 Generated Password: `{pwd}`")
+                                        st.caption("Please copy this password and provide it to the student.")
                                 elif r.status_code == 400: st.error("Student with this email likely already exists.")
                                 else: st.error(f"Failed: {r.text}")
         st.markdown("---")
@@ -602,6 +590,58 @@ def render_admin_dashboard():
 # ==========================================
 def render_student_dashboard():
     st.title("🎓 Student Portal")
+    with st.sidebar:
+        st.header("👤 Profile Settings")
+        
+        # 1. Update Phone & Name
+        with st.expander("Update Contact Info"):
+            with st.form("update_profile_form"):
+                # We can pre-fill current data if we fetch it, but for simplicity we just accept input
+                p_name = st.text_input("Full Name", help="Leave blank to keep current")
+                p_phone = st.text_input("Phone Number", help="Leave blank to keep current")
+                
+                if st.form_submit_button("Update Profile"):
+                    payload = {}
+                    if p_name: payload["full_name"] = p_name
+                    if p_phone: payload["phone"] = p_phone
+                    
+                    if not payload:
+                        st.warning("Please enter at least one field to update.")
+                    else:
+                        r = requests.put(f"{API_URL}/student/me", json=payload, headers=get_auth_headers())
+                        if r.status_code == 200:
+                            st.success("Profile updated successfully!")
+                            st.rerun() # Refresh to show changes if any
+                        else:
+                            st.error(f"Failed: {r.text}")
+
+        st.markdown("---")
+
+        # 2. Change Password
+        with st.expander("Change Password"):
+            with st.form("change_password_form"):
+                old_pwd = st.text_input("Current Password", type="password")
+                new_pwd = st.text_input("New Password", type="password")
+                confirm_pwd = st.text_input("Confirm New Password", type="password")
+                
+                if st.form_submit_button("Change Password"):
+                    if not old_pwd or not new_pwd:
+                        st.error("Please fill in all fields.")
+                    elif new_pwd != confirm_pwd:
+                        st.error("New passwords do not match.")
+                    else:
+                        payload = {
+                            "old_password": old_pwd,
+                            "new_password": new_pwd
+                        }
+                        r = requests.put(f"{API_URL}/student/change-password", json=payload, headers=get_auth_headers())
+                        if r.status_code == 200:
+                            st.success("Password changed successfully!")
+                        elif r.status_code == 400:
+                            st.error("Incorrect current password.")
+                        else:
+                            st.error(f"Failed: {r.text}")
+    
     st.button("Logout", on_click=logout, type="secondary")
     
     # CHECK IF EXAM IS ACTIVE
@@ -804,6 +844,85 @@ def render_exam_page():
         else:
             st.error("Failed to save score. Please try again.")
 
+def render_super_admin_dashboard():
+    st.title("🛡️ Super Admin Console")
+    st.button("Logout", on_click=logout, type="secondary")
+    st.markdown("---")
+    st.warning("⚠️ Restricted Access: Create Admin Profiles below.")
+
+    # 1. Create New Admin Section
+    st.subheader("Create New Admin Profile")
+    with st.form("create_admin_form"):
+        a_name = st.text_input("Full Name")
+        a_email = st.text_input("Email (Login ID)")
+        a_password = st.text_input("Password", type="password", value="")
+        a_confirm = st.text_input("Confirm Password", type="password")
+        
+        submitted = st.form_submit_button("Create Admin")
+        
+        if submitted:
+            if not a_email or not a_password:
+                st.error("Email and Password are required.")
+            elif a_password != a_confirm:
+                st.error("Passwords do not match.")
+            else:
+                # Payload matches AdminCreateRequest
+                payload = {
+                    "email": a_email,
+                    "password": a_password,
+                    "full_name": a_name
+                }
+                with st.spinner("Creating Admin..."):
+                    r = requests.post(f"{API_URL}/super-admin/create-admin", json=payload, headers=get_auth_headers())
+                    if r.status_code == 201:
+                        st.success(f"Admin {a_email} created successfully!")
+                        st.info(f"Credentials: {a_email} / {a_password}")
+                    elif r.status_code == 403:
+                        st.error("Access Denied: You do not have Super Admin privileges.")
+                    else:
+                        st.error(f"Failed: {r.text}")
+
+    st.markdown("---")
+    # Optional: You can add logic to list existing admins here using a GET endpoint if you build one
+    st.subheader("Existing Admin Profiles")
+    
+    try:
+        # Fetch admins from backend
+        r = requests.get(f"{API_URL}/super-admin/admins", headers=get_auth_headers())
+        
+        if r.status_code == 200:
+            admins = r.json()
+            
+            if not admins:
+                st.info("No admins found.")
+            else:
+                # Prepare data for DataFrame
+                admin_data = []
+                for a in admins:
+                    # Clean up ID for display
+                    display_id = str(a['id'])[:8] + "..." if a.get('id') else "N/A"
+                    
+                    # Format role for readability
+                    display_role = a.get('role', '').replace('_', ' ').title()
+                    
+                    admin_data.append({
+                        "Name": a.get('full_name', 'N/A'),
+                        "Email": a.get('email', 'N/A'),
+                        "Role": display_role,
+                        "ID": display_id,
+                        "Created": str(a.get('created_at', ''))[:10]
+                    })
+                
+                # Create DataFrame
+                df = pd.DataFrame(admin_data)
+                st.dataframe(df, use_container_width=True)
+                
+        else:
+            st.error("Failed to load admin list.")
+            
+    except Exception as e:
+        st.error(f"Error loading admins: {e}")
+
 # ==========================================
 # MAIN ROUTER
 # ==========================================
@@ -834,6 +953,8 @@ def main():
         # Route
         if current_page == "admin" and st.session_state.role == 'admin':
             render_admin_dashboard()
+        elif current_page == "super_admin" and st.session_state.role == 'super_admin':
+            render_super_admin_dashboard()
         elif current_page == "student" and st.session_state.role == 'student':
             render_student_dashboard()
         else:
