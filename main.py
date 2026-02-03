@@ -10,6 +10,8 @@ from jose import JWTError, jwt
 import requests
 from jose import jwk
 import datetime
+import secrets
+import string
 
 # Imports from your existing files
 from models import generate_questions
@@ -34,43 +36,41 @@ def create_student_token(email: str, student_id: str):
 app = FastAPI(title="Admin Assessment API", version="1.2.0")
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    """
-    Verifies token. Checks BOTH 'profiles' (Admins) and 'students' tables.
-    """
     payload = verify_jwt(token)
-    
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token structure")
 
     user_id = payload.get("sub")
-    if not user_id: raise HTTPException(status_code=401, detail="Invalid user payload")
+    if not user_id: 
+        raise HTTPException(status_code=401, detail="Invalid user payload")
     
     admin = get_supabase_admin_client()
     
-    # 1. Try finding in 'profiles' (Admin)
-    try:
-        profile = admin.table('profiles').select('role').eq('id', user_id).single().execute()
-        if profile.data:
-            return {"id": user_id, "role": profile.data['role'], "email": payload.get("email")}
-    except:
-        pass # Not a profile, check students next
+    # 1. Check Student
+    if payload.get("role") == "student":
+        try:
+            student = admin.table('students').select('role, full_name, email').eq('id', user_id).single().execute()
+            if student.data:
+                return {
+                    "id": user_id, "role": "student", 
+                    "email": student.data['email'], "full_name": student.data['full_name']
+                }
+        except: pass
+        raise HTTPException(status_code=401, detail="Student record not found")
 
-    # 2. Try finding in 'students' (Student)
+    # 2. Check Profile (Admin or Super Admin)
     try:
-        student = admin.table('students').select('role, full_name, email').eq('id', user_id).single().execute()
-        if student.data:
+        profile = admin.table('profiles').select('*').eq('id', user_id).single().execute()
+        if profile.data:
             return {
                 "id": user_id, 
-                "role": student.data['role'], 
-                "email": student.data['email'],
-                "full_name": student.data['full_name']
+                "role": profile.data['role'], 
+                "email": profile.data['email'],
+                "full_name": profile.data['full_name']
             }
-    except:
-        pass
+    except: pass
 
-    # 3. If neither found
-    raise HTTPException(status_code=401, detail="User not found in profiles or students table")
-
+    raise HTTPException(status_code=401, detail="User not found")
 class SignupRequest(BaseModel):
     email: str
     password: str
@@ -79,8 +79,6 @@ class SignupRequest(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
-
-
 
 # --- Pydantic Schemas ---
 
@@ -116,11 +114,16 @@ class ClientCreate(BaseModel):
     
 class StudentCreate(BaseModel):
     email: str
-    password: str
+    password: Optional[str] = None
     full_name: Optional[str] = None
     client_id: uuid.UUID
     role: str = "student"
     phone: Optional[str] = None
+
+class AdminCreateRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str
 
 class AssignModuleRequest(BaseModel):
     module_id: uuid.UUID
@@ -527,6 +530,93 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     except Exception as e:
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
+@app.post("/admin/login", response_model=Token)
+async def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Login for Admins and Super Admins using the 'profiles' table.
+    """
+    admin = get_supabase_admin_client()
+    
+    try:
+        # 1. Check if email exists in profiles table
+        response = admin.table('profiles').select("*").eq('email', form_data.username).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=400, detail="Incorrect email or password")
+            
+        profile = response.data[0]
+        
+        # 2. Verify Password (Plain text comparison)
+        if profile['password'] != form_data.password:
+            raise HTTPException(status_code=400, detail="Incorrect email or password")
+            
+        # 3. Generate Token
+        payload = {
+            "sub": str(profile['id']),
+            "email": profile['email'],
+            "role": profile['role'], # 'admin' or 'super_admin'
+            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        }
+        access_token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+        
+        return {"access_token": access_token, "token_type": "bearer"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Admin Login Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.post("/super-admin/create-admin", status_code=201)
+async def create_new_admin(req: AdminCreateRequest, current_user = Depends(get_current_user)):
+    """
+    Super Admin only: Creates a new Admin Profile.
+    """
+    # Authorization Check
+    if current_user.get('role') != 'super_admin':
+        raise HTTPException(status_code=403, detail="Only Super Admins can create new admins")
+
+    admin_client = get_supabase_admin_client()
+    
+    # Data to insert into profiles table
+    data = {
+        "email": req.email,
+        "password": req.password, 
+        "full_name": req.full_name,
+        "role": "admin"
+    }
+    
+    try:
+        response = admin_client.table('profiles').insert(data).execute()
+        return response.data[0]
+    except Exception as e:
+        # Handle duplicate email or other DB errors
+        if "duplicate" in str(e).lower():
+             raise HTTPException(status_code=400, detail="An admin with this email already exists.")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add this endpoint with your other super admin endpoints
+
+@app.get("/super-admin/admins")
+async def get_all_admins(current_user = Depends(get_current_user)):
+    """
+    Fetches all admins and super admins.
+    Protected: Super Admins only.
+    """
+    # Authorization: Only Super Admins can view the admin list
+    if current_user.get('role') != 'super_admin':
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    client = get_supabase_admin_client()
+    
+    try:
+        # Select all profiles where role is admin or super_admin
+        response = client.table('profiles').select("*").in_("role", ["admin", "super_admin"]).execute()
+        return response.data
+    except Exception as e:
+        print(f"Error fetching admins: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch admins")
+
 @app.get("/users/me")
 async def read_users_me(current_user = Depends(get_current_user)):
     return current_user
@@ -534,6 +624,11 @@ async def read_users_me(current_user = Depends(get_current_user)):
 @app.post("/admin/students", status_code=201)
 async def create_student(student: StudentCreate):
     admin = get_supabase_admin_client()
+    
+    if not student.password:
+        # Create a 12-character alphanumeric string
+        alphabet = string.ascii_letters + string.digits
+        student.password = ''.join(secrets.choice(alphabet) for _ in range(12))
     
     data = {
         "email": student.email,
@@ -546,9 +641,16 @@ async def create_student(student: StudentCreate):
     
     try:
         response = admin.table('students').insert(data).execute()
-        return response.data[0]
+        created_student = response.data[0]
+        
+        # Return the password in the response so the frontend can display it
+        return {
+            **created_student, 
+            "generated_password": student.password
+        }
     except Exception as e:
-        # ... existing error handling ...
+        if "duplicate" in str(e).lower():
+             raise HTTPException(status_code=400, detail="A student with this email already exists.")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/admin/students")
@@ -755,3 +857,71 @@ async def submit_submission(sub: SubmissionCreate, current_user = Depends(get_cu
     except Exception as e:
         print(f"Submission Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to save score.")
+
+# 1. Add these new Schemas with your other Pydantic classes
+
+class StudentUpdate(BaseModel):
+    phone: Optional[str] = None
+    full_name: Optional[str] = None
+
+class StudentPasswordChange(BaseModel):
+    old_password: str
+    new_password: str
+
+# 2. Add these new Endpoints
+
+@app.put("/student/me")
+async def update_student_profile(update: StudentUpdate, current_user = Depends(get_current_user)):
+    """
+    Allows a student to update their profile (Phone, Name).
+    """
+    if current_user.get('role') != 'student':
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    admin = get_supabase_admin_client()
+    
+    # exclude_unset=True ensures we only update fields provided in the request
+    update_data = update.dict(exclude_unset=True)
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No data provided for update")
+
+    try:
+        admin.table('students').update(update_data).eq('id', current_user['id']).execute()
+        return {"message": "Profile updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+
+@app.put("/student/change-password")
+async def change_student_password(req: StudentPasswordChange, current_user = Depends(get_current_user)):
+    """
+    Allows a student to change their password.
+    Verifies the old password first.
+    """
+    if current_user.get('role') != 'student':
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    admin = get_supabase_admin_client()
+    
+    try:
+        # 1. Fetch current student to verify old password
+        response = admin.table('students').select("password").eq('id', current_user['id']).single().execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Student not found")
+            
+        current_db_password = response.data['password']
+        
+        # 2. Verify Old Password (Plain text comparison as per existing architecture)
+        if current_db_password != req.old_password:
+            raise HTTPException(status_code=400, detail="Incorrect old password")
+            
+        # 3. Update to new password
+        admin.table('students').update({"password": req.new_password}).eq('id', current_user['id']).execute()
+        
+        return {"message": "Password changed successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error changing password: {e}")
